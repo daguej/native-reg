@@ -2,6 +2,9 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <atomic>
+#include <memory>
+#include <optional>
 #include <vector>
 
 #ifndef NAPI_CPP_EXCEPTIONS
@@ -550,6 +553,93 @@ void closeKey(const CallbackInfo& info) {
     }
 }
 
+class Watcher {
+private:
+    ThreadSafeFunction tsfn;
+    std::thread nativeThread;
+    HKEY hKey;
+    HANDLE hEvent;
+
+public:
+    Watcher() {}
+    Watcher(Napi::Env env, HKEY hkey, std::wstring subKey, Function cb) {
+
+        this->hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+
+        auto status = RegOpenKeyExW(
+            hkey,
+            subKey.c_str(),
+            0,
+            KEY_NOTIFY | KEY_WOW64_64KEY,
+            &this->hKey
+        );
+
+        if (status != ERROR_SUCCESS)
+        {
+            throw win32_error(env, status, "RegOpenKeyExW");
+        }
+
+        status = this->RegNotifyChange();
+
+        if (status != ERROR_SUCCESS)
+        {
+            throw win32_error(env, status, "RegNotifyChangeKeyValue");
+        }
+
+        this->tsfn = ThreadSafeFunction::New(
+            env,
+            cb,
+            "native-reg watcher",
+            0,
+            1,
+            [&](Napi::Env) {
+                nativeThread.join();
+            });
+
+        this->nativeThread = std::thread([&] {
+            auto callback = []( Napi::Env env, Function jsCallback ) {
+                jsCallback.Call(0, NULL);
+            };
+
+            while (WaitForSingleObject(hEvent, INFINITE) != WAIT_FAILED) {
+                napi_status status = tsfn.BlockingCall(callback);
+                if (status != napi_ok || RegNotifyChange() != ERROR_SUCCESS)
+                    break;
+            }
+
+        });
+
+    }
+
+    LSTATUS RegNotifyChange() {
+        const DWORD dwEventFilter = REG_NOTIFY_CHANGE_NAME |
+                                    REG_NOTIFY_CHANGE_ATTRIBUTES |
+                                    REG_NOTIFY_CHANGE_LAST_SET |
+                                    REG_NOTIFY_CHANGE_SECURITY;
+
+        return RegNotifyChangeKeyValue(
+            this->hKey,
+            TRUE,
+            dwEventFilter,
+            this->hEvent,
+            TRUE
+        );
+    }
+};
+
+std::optional<Watcher> w;
+Value watch(const CallbackInfo &info)
+{
+    auto env = info.Env();
+
+    auto hkey = to_hkey(info[0]);
+    auto subKey = to_wstring(info[1]);
+    auto cb = info[2].As<Function>();
+
+    w.emplace(env, hkey, subKey, cb);
+    return env.Null();
+}
+
 // error handling for functions not called through the C++ wrapper
 #define RAISE_IF_FAILED(env, expr) \
     if (const napi_status status = (expr); status != napi_ok) { \
@@ -620,6 +710,7 @@ napi_value Init(napi_env env, napi_value exports) {
         NAPI_DESCRIPTOR_FUNCTION(deleteKeyValue),
         NAPI_DESCRIPTOR_FUNCTION(deleteValue),
         NAPI_DESCRIPTOR_FUNCTION(closeKey),
+        NAPI_DESCRIPTOR_FUNCTION(watch),
     });
 
     return exports;

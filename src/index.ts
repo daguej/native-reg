@@ -391,3 +391,15 @@ export function getValue(
 export function queryValue(hkey: HKEY, valueName: string | null): ParsedValue | null {
   return parseValue(queryValueRaw(hkey, valueName));
 }
+
+export function watch(
+  hkey: HKEY,
+  subKey: string,
+  cb: () => void,
+): void {
+  assert(isWindows);
+  assert(isHKEY(hkey));
+  assert(typeof subKey === 'string');
+  assert(typeof cb === 'function');
+  native.watch(hkey, subKey, cb);
+}
