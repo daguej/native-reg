@@ -392,14 +392,18 @@ export function queryValue(hkey: HKEY, valueName: string | null): ParsedValue | 
   return parseValue(queryValueRaw(hkey, valueName));
 }
 
+export interface Watcher {
+  close(): void;
+}
+
 export function watch(
   hkey: HKEY,
   subKey: string,
   cb: () => void,
-): void {
+): Watcher {
   assert(isWindows);
   assert(isHKEY(hkey));
   assert(typeof subKey === 'string');
   assert(typeof cb === 'function');
-  native.watch(hkey, subKey, cb);
+  return native.watch(hkey, subKey, cb);
 }

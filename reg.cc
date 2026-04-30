@@ -4,7 +4,6 @@
 #include <windows.h>
 #include <atomic>
 #include <memory>
-#include <optional>
 #include <vector>
 
 #ifndef NAPI_CPP_EXCEPTIONS
@@ -557,87 +556,96 @@ class Watcher {
 private:
     ThreadSafeFunction tsfn;
     std::thread nativeThread;
-    HKEY hKey;
-    HANDLE hEvent;
-
-public:
-    Watcher() {}
-    Watcher(Napi::Env env, HKEY hkey, std::wstring subKey, Function cb) {
-
-        this->hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-
-        auto status = RegOpenKeyExW(
-            hkey,
-            subKey.c_str(),
-            0,
-            KEY_NOTIFY | KEY_WOW64_64KEY,
-            &this->hKey
-        );
-
-        if (status != ERROR_SUCCESS)
-        {
-            throw win32_error(env, status, "RegOpenKeyExW");
-        }
-
-        status = this->RegNotifyChange();
-
-        if (status != ERROR_SUCCESS)
-        {
-            throw win32_error(env, status, "RegNotifyChangeKeyValue");
-        }
-
-        this->tsfn = ThreadSafeFunction::New(
-            env,
-            cb,
-            "native-reg watcher",
-            0,
-            1,
-            [&](Napi::Env) {
-                nativeThread.join();
-            });
-
-        this->nativeThread = std::thread([&] {
-            auto callback = []( Napi::Env env, Function jsCallback ) {
-                jsCallback.Call(0, NULL);
-            };
-
-            while (WaitForSingleObject(hEvent, INFINITE) != WAIT_FAILED) {
-                napi_status status = tsfn.BlockingCall(callback);
-                if (status != napi_ok || RegNotifyChange() != ERROR_SUCCESS)
-                    break;
-            }
-
-        });
-
-    }
+    HKEY hKey = nullptr;
+    HANDLE hEvent = nullptr;
+    HANDLE hStopEvent = nullptr;
+    std::atomic<bool> closed{false};
 
     LSTATUS RegNotifyChange() {
         const DWORD dwEventFilter = REG_NOTIFY_CHANGE_NAME |
                                     REG_NOTIFY_CHANGE_ATTRIBUTES |
                                     REG_NOTIFY_CHANGE_LAST_SET |
                                     REG_NOTIFY_CHANGE_SECURITY;
+        return RegNotifyChangeKeyValue(hKey, TRUE, dwEventFilter, hEvent, TRUE);
+    }
 
-        return RegNotifyChangeKeyValue(
-            this->hKey,
-            TRUE,
-            dwEventFilter,
-            this->hEvent,
-            TRUE
-        );
+public:
+    Watcher() = delete;
+    Watcher(const Watcher&) = delete;
+    Watcher& operator=(const Watcher&) = delete;
+
+    Watcher(Napi::Env env, HKEY hkey, std::wstring subKey, Function cb) {
+        hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+        hStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+        auto status = RegOpenKeyExW(
+            hkey,
+            subKey.c_str(),
+            0,
+            KEY_NOTIFY | KEY_WOW64_64KEY,
+            &hKey);
+
+        if (status != ERROR_SUCCESS) {
+            CloseHandle(hEvent);
+            CloseHandle(hStopEvent);
+            throw win32_error(env, status, "RegOpenKeyExW");
+        }
+
+        status = RegNotifyChange();
+        if (status != ERROR_SUCCESS) {
+            RegCloseKey(hKey);
+            CloseHandle(hEvent);
+            CloseHandle(hStopEvent);
+            throw win32_error(env, status, "RegNotifyChangeKeyValue");
+        }
+
+        tsfn = ThreadSafeFunction::New(env, cb, "native-reg watcher", 0, 1);
+
+        nativeThread = std::thread([this] {
+            auto callback = [](Napi::Env, Function jsCallback) {
+                jsCallback.Call(0, NULL);
+            };
+
+            HANDLE handles[2] = {hStopEvent, hEvent};
+            while (WaitForMultipleObjects(2, handles, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+                if (tsfn.BlockingCall(callback) != napi_ok) break;
+                if (RegNotifyChange() != ERROR_SUCCESS) break;
+            }
+        });
+    }
+
+    ~Watcher() {
+        close();
+    }
+
+    void close() {
+        if (closed.exchange(true)) return;
+        SetEvent(hStopEvent);
+        if (nativeThread.joinable()) {
+            nativeThread.join();
+        }
+        tsfn.Release();
+        if (hKey) { RegCloseKey(hKey); hKey = nullptr; }
+        if (hEvent) { CloseHandle(hEvent); hEvent = nullptr; }
+        if (hStopEvent) { CloseHandle(hStopEvent); hStopEvent = nullptr; }
     }
 };
 
-std::optional<Watcher> w;
-Value watch(const CallbackInfo &info)
-{
+Value watch(const CallbackInfo& info) {
     auto env = info.Env();
 
     auto hkey = to_hkey(info[0]);
     auto subKey = to_wstring(info[1]);
     auto cb = info[2].As<Function>();
 
-    w.emplace(env, hkey, subKey, cb);
-    return env.Null();
+    auto watcher = std::make_shared<Watcher>(env, hkey, subKey, cb);
+
+    auto obj = Object::New(env);
+    obj.Set("close", Function::New(env, [watcher](const CallbackInfo&) {
+        watcher->close();
+    }));
+
+    return obj;
 }
 
 // error handling for functions not called through the C++ wrapper
