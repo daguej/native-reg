@@ -1,3 +1,4 @@
+import EventEmitter = require('events');
 const assert = require('assert');
 const types = require('util').types || {
   // approximate polyfill for Node.js < 10
@@ -392,18 +393,47 @@ export function queryValue(hkey: HKEY, valueName: string | null): ParsedValue | 
   return parseValue(queryValueRaw(hkey, valueName));
 }
 
-export interface Watcher {
-  close(): void;
+class RegistryWatcher extends EventEmitter<{ change: [] }> {
+  private _native;
+
+  constructor(public readonly hkey: HKEY, public readonly subKey: string) {
+    super();
+
+    this._native = native.watch(hkey, subKey, () => {
+      this.emit('change');
+    });
+  }
+
+  /**
+   * Stops watching the registry path associated with this instance and frees native resources.
+   */
+  close() {
+    this._native.close();
+  }
 }
 
+export type { RegistryWatcher };
+
+/**
+ * Watches a given key and all of its descendants for changes.  The returned `RegistryWatcher` is an
+ * `EventEmitter` that emits `change` events when any data changes in the key or its children.
+ * 
+ * Due to the way the Windows API (`RegNotifyChangeKeyValue`) works, we only receive a notification that
+ * *something* in the watched tree changed, but not what specifically; therefore the `change` event has no arguments.
+ * 
+ * Note that each watcher starts up a native background thread.  The thread only wakes when changes occur
+ * in the watched registry path, but it necessarily consumes some RAM (roughly 64 kB each).
+ * Call `RegistryWatcher.close()` to stop watching the registry and release resources.
+ * @param hkey The registry root key.
+ * @param subKey The path to the key to be watched.
+ * @returns A `RegistryWatcher` instance.
+ */
 export function watch(
   hkey: HKEY,
-  subKey: string,
-  cb: () => void,
-): Watcher {
+  subKey: string
+): RegistryWatcher {
   assert(isWindows);
   assert(isHKEY(hkey));
   assert(typeof subKey === 'string');
-  assert(typeof cb === 'function');
-  return native.watch(hkey, subKey, cb);
+  return new RegistryWatcher(hkey, subKey);
 }
