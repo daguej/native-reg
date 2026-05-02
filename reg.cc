@@ -560,13 +560,11 @@ private:
     HANDLE hEvent = nullptr;
     HANDLE hStopEvent = nullptr;
     std::atomic<bool> closed{false};
+    BOOL bWatchSubtree = FALSE;
+    DWORD dwEventFilter = 0;
 
     LSTATUS RegNotifyChange() {
-        const DWORD dwEventFilter = REG_NOTIFY_CHANGE_NAME |
-                                    REG_NOTIFY_CHANGE_ATTRIBUTES |
-                                    REG_NOTIFY_CHANGE_LAST_SET |
-                                    REG_NOTIFY_CHANGE_SECURITY;
-        return RegNotifyChangeKeyValue(hKey, TRUE, dwEventFilter, hEvent, TRUE);
+        return RegNotifyChangeKeyValue(hKey, bWatchSubtree, dwEventFilter, hEvent, TRUE);
     }
 
 public:
@@ -574,9 +572,11 @@ public:
     Watcher(const Watcher&) = delete;
     Watcher& operator=(const Watcher&) = delete;
 
-    Watcher(Napi::Env env, HKEY hkey, std::wstring subKey, Function cb) {
+    Watcher(Napi::Env env, HKEY hkey, std::wstring subKey, BOOL watchSubtree, DWORD eventFilter, Function cb) {
         hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
         hStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        bWatchSubtree = watchSubtree;
+        dwEventFilter = eventFilter & ~REG_NOTIFY_THREAD_AGNOSTIC; // do not allow JS to set this flag
 
         auto status = RegOpenKeyExW(
             hkey,
@@ -636,9 +636,11 @@ Value watch(const CallbackInfo& info) {
 
     auto hkey = to_hkey(info[0]);
     auto subKey = to_wstring(info[1]);
-    auto cb = info[2].As<Function>();
+    auto watchSubtree = info[2].As<Boolean>().Value();
+    auto notifyFilter = info[3].As<Number>().Uint32Value();
+    auto cb = info[4].As<Function>();
 
-    auto watcher = std::make_shared<Watcher>(env, hkey, subKey, cb);
+    auto watcher = std::make_shared<Watcher>(env, hkey, subKey, watchSubtree, notifyFilter, cb);
 
     auto obj = Object::New(env);
     obj.Set("close", Function::New(env, [watcher](const CallbackInfo&) {
